@@ -1,4 +1,3 @@
-
 '''
 PPC Hackathon — Participant Boilerplate
 You must implement two functions: plan() and control()
@@ -30,17 +29,18 @@ def plan(cones: list[dict]) -> list[dict]:
     """
     path = []
     # TODO: implement your path planning here
-    blue = np.array([[cone["x"], cone["y"]] for cone in cones if cone["side"] == "left"])
+    blue   = np.array([[cone["x"], cone["y"]] for cone in cones if cone["side"] == "left"])
     yellow = np.array([[cone["x"], cone["y"]] for cone in cones if cone["side"] == "right"])
 
     # implement a planning algorithm to generate a path from the blue and yellow cones
+    # Sort cones by index so waypoints are ordered along the track
+    left_cones  = sorted([c for c in cones if c["side"] == "left"],  key=lambda c: c["index"])
+    right_cones = sorted([c for c in cones if c["side"] == "right"], key=lambda c: c["index"])
 
-
-
-
-
-
-
+    # Midline interpolation: average of matched left/right cones at each index
+    for lc, rc in zip(left_cones, right_cones):
+        mid_x = (lc["x"] + rc["x"]) / 2.0
+        mid_y = (lc["y"] + rc["y"]) / 2.0
+        path.append({"x": float(mid_x), "y": float(mid_y)})
 
     return path
-
