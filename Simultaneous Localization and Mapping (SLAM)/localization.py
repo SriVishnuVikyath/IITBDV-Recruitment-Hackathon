@@ -95,6 +95,18 @@ def get_measurements(pos: np.ndarray, heading: float) -> np.ndarray:
     return local + np.random.normal(0, NOISE_STD, local.shape)
 
 
+def step_kinematic(pos: np.ndarray, heading: float,
+                   velocity: float, steering: float):
+    """One bicycle-model step; returns (new_pos, new_heading)."""
+    new_pos = pos.copy()
+    new_pos[0] += velocity * np.cos(heading) * DT
+    new_pos[1] += velocity * np.sin(heading) * DT
+    new_heading = angle_wrap(
+        heading + (velocity / WHEELBASE) * np.tan(steering) * DT
+    )
+    return new_pos, new_heading
+
+
 def draw_track(ax, alpha_b: float = 0.4, alpha_y: float = 0.4) -> None:
     ax.scatter(BLUE_CONES[:, 0],   BLUE_CONES[:, 1],
                c="royalblue", marker="^", s=65,  alpha=alpha_b,
@@ -147,20 +159,49 @@ class Solution(Bot):
         # Internal state exposed for visualisation
         self._global_meas = np.zeros((0, 2))
         self._assoc       = np.array([], dtype=int)
+        
+        # Localization uncertainty covariance P (x, y, theta)
+        self.P = np.zeros((3, 3))
+        
+        # Process noise Q (variance of odometry steps)
+        self.Q = np.diag([0.05**2, 0.05**2, np.deg2rad(1.0)**2])
 
     # ------------------------------------------------------------------
     def localization(self, velocity, steering):
         """
-        Bicycle kinematic model (dead reckoning):
-            ẋ = v·cos(ψ)
-            ẏ = v·sin(ψ)
-            ψ̇ = (v / L)·tan(δ)
+        Bicycle kinematic model with Exact Analytical Circular-Arc Integration:
+            If steer != 0, follows a circular arc.
+            If steer ≈ 0, follows linear path.
         """
-        self.pos[0]  += velocity * np.cos(self.heading) * DT
-        self.pos[1]  += velocity * np.sin(self.heading) * DT
-        self.heading  = angle_wrap(
-            self.heading + (velocity / WHEELBASE) * np.tan(steering) * DT
-        )
+        # Save old values
+        theta = self.heading
+
+        if abs(steering) > 1e-4:
+            # Exact circular arc
+            R = WHEELBASE / np.tan(steering)
+            d_theta = (velocity / R) * DT
+            
+            self.pos[0] += R * (np.sin(theta + d_theta) - np.sin(theta))
+            self.pos[1] += R * (-np.cos(theta + d_theta) + np.cos(theta))
+            self.heading = angle_wrap(theta + d_theta)
+            
+            # Jacobian F of the motion model w.r.t state (x, y, theta)
+            F = np.eye(3)
+            F[0, 2] = R * (np.cos(theta + d_theta) - np.cos(theta))
+            F[1, 2] = R * (np.sin(theta + d_theta) - np.sin(theta))
+        else:
+            # Linear approximation for near-zero steering
+            self.pos[0] += velocity * np.cos(theta) * DT
+            self.pos[1] += velocity * np.sin(theta) * DT
+            self.heading = angle_wrap(theta + (velocity / WHEELBASE) * np.tan(steering) * DT)
+            
+            # Jacobian F
+            F = np.eye(3)
+            F[0, 2] = -velocity * np.sin(theta) * DT
+            F[1, 2] = velocity * np.cos(theta) * DT
+            
+        # Propagate covariance: P = F * P * F^T + Q
+        self.P = F @ self.P @ F.T + self.Q
 
 
 # ── Problem 2 – Localization ───────────────────────────────────────────────────
@@ -170,29 +211,86 @@ def make_problem2():
     trajectory built purely from the kinematic model and steering commands.
     """
     sol     = Solution()
+    true_pos = CAR_START_POS.copy()
+    true_heading = CAR_START_HEADING
+    
     path_x  = [float(sol.pos[0])]
     path_y  = [float(sol.pos[1])]
+    
+    true_path_x = [float(true_pos[0])]
+    true_path_y = [float(true_pos[1])]
+    
+    squared_errors = []
+    lap_count = 1
+    
     fig, ax = plt.subplots(figsize=(10, 7))
     fig.suptitle("Problem 2 – Localization  (Dead Reckoning / Kinematic Model)",
                  fontsize=13, fontweight="bold")
 
     def update(frame):
+        nonlocal true_pos, true_heading, lap_count
         ax.clear()
-        steer = pure_pursuit(sol.pos, sol.heading, CENTERLINE)
-        sol.localization(SPEED, steer)
+        
+        # Ground Truth Update
+        steer_true = pure_pursuit(true_pos, true_heading, CENTERLINE)
+        true_pos, true_heading = step_kinematic(true_pos, true_heading, SPEED, steer_true)
+        true_path_x.append(float(true_pos[0]))
+        true_path_y.append(float(true_pos[1]))
+        
+        # Estimated Update (with synthetic noise on odometry inputs)
+        noisy_speed = SPEED + np.random.normal(0, 0.05)
+        noisy_steer = steer_true + np.random.normal(0, np.deg2rad(1.0))
+        sol.localization(noisy_speed, noisy_steer)
         path_x.append(float(sol.pos[0]))
         path_y.append(float(sol.pos[1]))
+        
+        # Metrics Tracking
+        err = np.linalg.norm(sol.pos - true_pos)
+        squared_errors.append(err**2)
 
         draw_track(ax)
+        
+        from matplotlib.patches import Ellipse
+        
+        # Draw uncertainty ellipse (3-sigma confidence)
+        cov_xy = sol.P[0:2, 0:2]
+        eigenvalues, eigenvectors = np.linalg.eig(cov_xy)
+        # Using the dominant eigenvector for angle
+        angle = np.degrees(np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0]))
+        width = 2 * 3 * np.sqrt(max(0, eigenvalues[0]))
+        height = 2 * 3 * np.sqrt(max(0, eigenvalues[1]))
+        
+        ellipse = Ellipse(xy=sol.pos, width=width, height=height, angle=angle,
+                          edgecolor='blue', facecolor='blue', alpha=0.15, zorder=3,
+                          label="3σ Uncertainty")
+        ax.add_patch(ellipse)
+        
+        ax.plot(true_path_x, true_path_y, color="black", lw=1.5, linestyle="--",
+                alpha=0.6, zorder=3, label="True path")
         ax.plot(path_x, path_y, color="magenta", lw=2.0,
-                alpha=0.85, zorder=4, label="Dead-reckoning path")
+                alpha=0.85, zorder=4, label="Estimated path")
         draw_car(ax, sol.pos, sol.heading)
+        draw_car(ax, true_pos, true_heading) # Draw true car behind
+        ax.scatter(true_pos[0], true_pos[1], c="black", s=160, zorder=6, alpha=0.3)
+        
+        current_rmse = np.sqrt(np.mean(squared_errors))
         setup_ax(ax,
             f"Frame {frame+1}/{N_FRAMES}  –  "
-            f"pos=({sol.pos[0]:.1f}, {sol.pos[1]:.1f})  "
-            f"ψ={np.degrees(sol.heading):.1f}°")
-        ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+            f"RMSE: {current_rmse:.2f}m")
+        
+        # Avoid duplicate labels in legend
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), loc="upper right", fontsize=8, framealpha=0.8)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
+        
+        if frame == N_FRAMES - 1:
+            final_rmse = np.sqrt(np.mean(squared_errors))
+            final_drift = np.linalg.norm(sol.pos - true_pos)
+            print(f"\n--- Lap {lap_count} ---")
+            print(f"[Metrics] Cumulative Trajectory RMSE: {final_rmse:.3f}m")
+            print(f"[Metrics] Current Position Drift: {final_drift:.3f}m")
+            lap_count += 1
 
     ani = FuncAnimation(fig, update, frames=N_FRAMES, interval=100, repeat=True)
     return fig, ani

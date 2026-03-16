@@ -80,19 +80,22 @@ def local_to_global(local_pts: np.ndarray,
     return (R @ local_pts.T).T + pos
 
 
-def get_measurements(pos: np.ndarray, heading: float) -> np.ndarray:
+def get_measurements(pos: np.ndarray, heading: float) -> tuple[np.ndarray, np.ndarray]:
     """
     Simulate a 2-D lidar: return visible cone positions as noisy
-    measurements in the car's LOCAL frame (x = forward, y = left).
+    measurements in the car's LOCAL frame (x = forward, y = left),
+    along with their true indices in MAP_CONES for evaluation.
     """
     dists   = np.linalg.norm(MAP_CONES - pos, axis=1)
-    visible = MAP_CONES[dists < SENSOR_RANGE]
+    visible_idx = np.where(dists < SENSOR_RANGE)[0]
+    visible = MAP_CONES[visible_idx]
     if len(visible) == 0:
-        return np.zeros((0, 2))
+        return np.zeros((0, 2)), np.array([], dtype=int)
     c, s = np.cos(heading), np.sin(heading)
     R    = np.array([[c, s], [-s, c]])       # world → local (transpose of above)
     local = (R @ (visible - pos).T).T
-    return local + np.random.normal(0, NOISE_STD, local.shape)
+    noisy_local = local + np.random.normal(0, NOISE_STD, local.shape)
+    return noisy_local, visible_idx
 
 
 def step_kinematic(pos: np.ndarray, heading: float,
@@ -163,13 +166,16 @@ class Solution(Bot):
     # ------------------------------------------------------------------
     def data_association(self, measurements, current_map):
         """
-        Nearest-Neighbour data association.
+        Global Assignment with Spatial Gating for data association.
+        Optimized with KD-Tree subset extraction to maintain O(N log M) running time.
         Steps:
           1. Transform local measurements → world frame using current pose.
-          2. For each measurement find the nearest cone in *current_map*.
-        Returns an int array of indices into current_map.
+          2. Query KD-Tree of the map for candidates near the measurements.
+          3. Compute pairwise distance matrix ONLY on the subset.
+          4. Use Hungarian algorithm (linear_sum_assignment) on the reduced dense matrix.
+        Returns an array mapping each measurement to a map index (-1 if unassociated).
         """
-        if len(measurements) == 0 or len(current_map) == 0:
+        if len(measurements) == 0:
             self._global_meas = np.zeros((0, 2))
             self._assoc       = np.array([], dtype=int)
             return self._assoc
@@ -177,8 +183,43 @@ class Solution(Bot):
         gm = local_to_global(measurements, self.pos, self.heading)
         self._global_meas = gm
 
-        D           = distance.cdist(gm, current_map)
-        self._assoc = np.argmin(D, axis=1)
+        if len(current_map) == 0:
+            self._assoc = np.full(len(measurements), -1, dtype=int)
+            return self._assoc
+
+        from scipy.optimize import linear_sum_assignment
+        from scipy.spatial import cKDTree
+        
+        GATE_THRESHOLD = 3.0
+        
+        # 1. Identify candidate map landmarks using KD-Tree to avoid dense N x M distance matrix
+        map_tree = cKDTree(current_map)
+        
+        # query_ball_point returns list of lists.
+        # Find all map indices that are within GATE_THRESHOLD of ANY measurement
+        candidate_indices_lists = map_tree.query_ball_point(gm, r=GATE_THRESHOLD)
+        
+        # Flatten and get unique map indices
+        unique_candidate_idx = np.unique([idx for sublist in candidate_indices_lists for idx in sublist])
+        
+        self._assoc = np.full(len(measurements), -1, dtype=int)
+        
+        if len(unique_candidate_idx) == 0:
+            return self._assoc
+            
+        # 2. Extract the subset of the map and compute small dense D
+        map_subset = current_map[unique_candidate_idx]
+        
+        D_subset = distance.cdist(gm, map_subset)
+        D_subset[D_subset > GATE_THRESHOLD] = 1e6
+        
+        row_ind, col_ind_subset = linear_sum_assignment(D_subset)
+        
+        # 3. Map the subset indices back to original map indices
+        for r, c_sub in zip(row_ind, col_ind_subset):
+            if D_subset[r, c_sub] < GATE_THRESHOLD:
+                self._assoc[r] = unique_candidate_idx[c_sub]
+                
         return self._assoc
 
 # ── Problem 1 – Data Association ──────────────────────────────────────────────
@@ -193,29 +234,51 @@ def make_problem1():
     fig.suptitle("Problem 1 – Data Association  (Nearest Neighbour)",
                  fontsize=13, fontweight="bold")
 
+    global_correct_assocs = 0
+    global_total_assocs = 0
+    lap_count = 1
+
     def update(frame):
+        nonlocal global_correct_assocs, global_total_assocs, lap_count
         ax.clear()
         steer = pure_pursuit(sol.pos, sol.heading, CENTERLINE)
-        meas  = get_measurements(sol.pos, sol.heading)
-        sol.data_association(meas, MAP_CONES)
+        meas, true_indices = get_measurements(sol.pos, sol.heading)
+        assocs = sol.data_association(meas, MAP_CONES)
+        
+        # Evaluate associations
+        if len(true_indices) > 0:
+            correct = np.sum(assocs == true_indices)
+            global_correct_assocs += correct
+            global_total_assocs += len(true_indices)
+            
         sol.pos, sol.heading = step_kinematic(sol.pos, sol.heading, SPEED, steer)
 
         draw_track(ax)
 
         if len(sol._global_meas) > 0:
             for idx, gm in zip(sol._assoc, sol._global_meas):
-                mc = MAP_CONES[idx]
-                ax.plot([gm[0], mc[0]], [gm[1], mc[1]],
-                        "g--", lw=1.0, alpha=0.65, zorder=3)
+                if idx != -1:
+                    mc = MAP_CONES[idx]
+                    ax.plot([gm[0], mc[0]], [gm[1], mc[1]],
+                            "g--", lw=1.0, alpha=0.65, zorder=3)
             ax.scatter(sol._global_meas[:, 0], sol._global_meas[:, 1],
                        c="cyan", s=45, zorder=5,
                        label=f"Measurements ({len(sol._global_meas)})")
 
         draw_car(ax, sol.pos, sol.heading)
+        
+        acc_str = f"Assoc Acc: {100.0 * global_correct_assocs / max(1, global_total_assocs):.1f}%" if global_total_assocs > 0 else ""
         setup_ax(ax, f"Frame {frame+1}/{N_FRAMES}  –  "
-                     "green lines = NN association")
+                     f"green lines = NN association  |  {acc_str}")
+                     
         ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
+        
+        if frame == N_FRAMES - 1:
+            final_acc = 100.0 * global_correct_assocs / max(1, global_total_assocs)
+            print(f"\n--- Lap {lap_count} ---")
+            print(f"[Metrics] Cumulative Association Accuracy: {final_acc:.2f}% ({global_correct_assocs}/{global_total_assocs})")
+            lap_count += 1
 
     ani = FuncAnimation(fig, update, frames=N_FRAMES, interval=100, repeat=True)
     return fig, ani

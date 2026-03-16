@@ -80,19 +80,22 @@ def local_to_global(local_pts: np.ndarray,
     return (R @ local_pts.T).T + pos
 
 
-def get_measurements(pos: np.ndarray, heading: float) -> np.ndarray:
+def get_measurements(pos: np.ndarray, heading: float) -> tuple[np.ndarray, np.ndarray]:
     """
     Simulate a 2-D lidar: return visible cone positions as noisy
-    measurements in the car's LOCAL frame (x = forward, y = left).
+    measurements in the car's LOCAL frame (x = forward, y = left),
+    along with their true indices in MAP_CONES for evaluation.
     """
     dists   = np.linalg.norm(MAP_CONES - pos, axis=1)
-    visible = MAP_CONES[dists < SENSOR_RANGE]
+    visible_idx = np.where(dists < SENSOR_RANGE)[0]
+    visible = MAP_CONES[visible_idx]
     if len(visible) == 0:
-        return np.zeros((0, 2))
+        return np.zeros((0, 2)), np.array([], dtype=int)
     c, s = np.cos(heading), np.sin(heading)
     R    = np.array([[c, s], [-s, c]])       # world → local (transpose of above)
     local = (R @ (visible - pos).T).T
-    return local + np.random.normal(0, NOISE_STD, local.shape)
+    noisy_local = local + np.random.normal(0, NOISE_STD, local.shape)
+    return noisy_local, visible_idx
 
 
 def step_kinematic(pos: np.ndarray, heading: float,
@@ -156,6 +159,10 @@ class Solution(Bot):
     def __init__(self):
         super().__init__()
         self.learned_map  = []                    # list of np.ndarray (2,)
+        
+        # Track raw structures: {'pos': np.ndarray(2,), 'hits': int, 'misses': int}
+        self._trackers = []
+        
         # Internal state exposed for visualisation
         self._global_meas = np.zeros((0, 2))
         self._assoc       = np.array([], dtype=int)
@@ -163,16 +170,68 @@ class Solution(Bot):
     # ------------------------------------------------------------------
     def mapping(self, measurements):
         """
-        Transform local measurements to world frame and accumulate unique
-        landmark estimates (distance-threshold deduplication).
+        Landmark Lifecycle Mapping with Linear Kalman Filter.
         """
         if len(measurements) == 0:
-            return
-        gm = local_to_global(measurements, self.pos, self.heading)
+            gm = np.zeros((0, 2))
+        else:
+            gm = local_to_global(measurements, self.pos, self.heading)
+            
+        matched_trackers = set()
+        
+        # Measurement noise covariance
+        R_cov = np.diag([NOISE_STD**2, NOISE_STD**2])
+        
         for p in gm:
-            if not self.learned_map or \
-               min(np.linalg.norm(p - q) for q in self.learned_map) > 2.0:
-                self.learned_map.append(p.copy())
+            if not self._trackers:
+                P_init = np.diag([1.0, 1.0])
+                self._trackers.append({'pos': p.copy(), 'P': P_init, 'hits': 1, 'misses': 0})
+                matched_trackers.add(0)
+            else:
+                dists = [np.linalg.norm(p - t['pos']) for t in self._trackers]
+                min_idx = np.argmin(dists)
+                if dists[min_idx] < 2.0:
+                    # Match found, update via Kalman Filter
+                    mu = self._trackers[min_idx]['pos']
+                    P = self._trackers[min_idx]['P']
+                    
+                    # Innovation
+                    y = p - mu
+                    # Innovation covariance (H = I)
+                    S = P + R_cov
+                    # Kalman Gain
+                    K = P @ np.linalg.inv(S)
+                    
+                    # Update state
+                    self._trackers[min_idx]['pos'] = mu + K @ y
+                    self._trackers[min_idx]['P'] = (np.eye(2) - K) @ P
+                    self._trackers[min_idx]['hits'] += 1
+                    matched_trackers.add(min_idx)
+                else:
+                    P_init = np.diag([1.0, 1.0])
+                    self._trackers.append({'pos': p.copy(), 'P': P_init, 'hits': 1, 'misses': 0})
+                    matched_trackers.add(len(self._trackers) - 1)
+                    
+        # Update misses for trackers in FOV that were NOT matched
+        for i, t in enumerate(self._trackers):
+            if i not in matched_trackers:
+                # If within sensor range but not seen, it's a miss
+                if np.linalg.norm(t['pos'] - self.pos) < SENSOR_RANGE:
+                    t['misses'] += 1
+                    
+        # Pruning and filtering building learned_map
+        kept_trackers = []
+        self.learned_map = []
+        for t in self._trackers:
+            if t['misses'] > 5 and t['hits'] < 3:
+                continue # Prune ghost cone
+            kept_trackers.append(t)
+            
+            # Confirm if hits >= 2
+            if t['hits'] >= 2:
+                self.learned_map.append(t['pos'].copy())
+                
+        self._trackers = kept_trackers
 
 # ── Problem 3 – Mapping ───────────────────────────────────────────────────────
 def make_problem3():
@@ -185,11 +244,19 @@ def make_problem3():
     fig, ax = plt.subplots(figsize=(10, 7))
     fig.suptitle("Problem 3 – Mapping  (Local → Global Transform + Deduplication)",
                  fontsize=13, fontweight="bold")
+                 
+    seen_true_cones = set()
+    lap_count = 1
 
     def update(frame):
+        nonlocal lap_count
         ax.clear()
         steer = pure_pursuit(sol.pos, sol.heading, CENTERLINE)
-        meas  = get_measurements(sol.pos, sol.heading)
+        meas, true_indices = get_measurements(sol.pos, sol.heading)
+        
+        for idx in true_indices:
+            seen_true_cones.add(int(idx))
+            
         sol.pos, sol.heading = step_kinematic(sol.pos, sol.heading, SPEED, steer)
         sol.mapping(meas)
 
@@ -207,6 +274,27 @@ def make_problem3():
             f"map size: {len(sol.learned_map)} / {len(MAP_CONES)} cones")
         ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
+        
+        if frame == N_FRAMES - 1:
+            true_count = len(seen_true_cones)
+            pred_count = len(sol.learned_map)
+            
+            # Map RMSE: nearest ground-truth cone for every estimated cone
+            total_sq_err = 0.0
+            if pred_count > 0:
+                for est_pt in sol.learned_map:
+                    dists = np.linalg.norm(MAP_CONES - est_pt, axis=1)
+                    total_sq_err += np.min(dists)**2
+                map_rmse = np.sqrt(total_sq_err / pred_count)
+            else:
+                map_rmse = float('inf')
+                
+            print(f"\n--- Lap {lap_count} ---")
+            print(f"[Metrics] Cumulative Visible True Cones: {true_count}")
+            print(f"[Metrics] Estimated Map Size: {pred_count}")
+            print(f"[Metrics] Map Size Error: {abs(pred_count - true_count)} cones")
+            print(f"[Metrics] Map Positional RMSE: {map_rmse:.3f}m")
+            lap_count += 1
 
     ani = FuncAnimation(fig, update, frames=N_FRAMES, interval=100, repeat=True)
     return fig, ani
